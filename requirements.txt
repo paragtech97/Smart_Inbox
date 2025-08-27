@@ -1,6 +1,6 @@
 Flask==2.3.2
 openai==1.0.0
-apscheduler==3.10.6
+apscheduler==3.10.5
 google-auth==2.21.0
 google-auth-oauthlib==1.1.0
 google-api-python-client==2.95.0
