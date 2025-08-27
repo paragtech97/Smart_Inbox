@@ -7,32 +7,99 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from bs4 import BeautifulSoup
 import openai
+from apscheduler.schedulers.background import BackgroundScheduler
+import sqlite3
+from datetime import datetime
 
+# ---- CONFIG ----
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 DEFAULT_MAX_EMAILS = 5
 IMPORTANT_LABEL = "Important Emails"
 MARKETING_LABEL = "Marketing Emails"
 
+# For local dev: allow http://localhost OAuth
+if os.environ.get("FLASK_ENV") == "development":
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+
+# ---- DATABASE HELPERS ----
+DB_FILE = "users.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            token TEXT,
+            refresh_token TEXT,
+            token_uri TEXT,
+            client_id TEXT,
+            client_secret TEXT,
+            scopes TEXT,
+            expiry TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_user_credentials(email, creds: Credentials):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?,?,?)
+    ''', (
+        email,
+        creds.token,
+        creds.refresh_token,
+        creds.token_uri,
+        creds.client_id,
+        creds.client_secret,
+        json.dumps(creds.scopes),
+        creds.expiry.isoformat() if getattr(creds, "expiry", None) else None
+    ))
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM users')
+    rows = c.fetchall()
+    conn.close()
+    users = []
+    for row in rows:
+        users.append({
+            "email": row[0],
+            "token": row[1],
+            "refresh_token": row[2],
+            "token_uri": row[3],
+            "client_id": row[4],
+            "client_secret": row[5],
+            "scopes": json.loads(row[6]),
+            "expiry": row[7]
+        })
+    return users
+
+# ---- APP CREATION ----
 def create_app():
     app = Flask(__name__)
     app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
     openai.api_key = os.environ.get("OPENAI_API_KEY")
+    init_db()
 
-    # ---- Helpers ----
-    def load_client_config():
-        path = os.environ.get("GOOGLE_CLIENT_SECRETS_FILE", "credentials.json")
-        if not os.path.exists(path):
-            raise RuntimeError("credentials.json not found. Provide via local file or secret file.")
-        return path
+    # ---- HELPERS ----
+def load_client_config():
+    credentials_content = os.getenv("GOOGLE_CLIENT_SECRETS_JSON")
+    if not credentials_content:
+        raise RuntimeError(
+            "GOOGLE_CLIENT_SECRETS_JSON environment variable not found. "
+            "Set it in Render's dashboard for your service."
+        )
+    return json.loads(credentials_content)
 
-    def build_gmail_service():
-        creds_dict = session.get("google_creds")
-        if not creds_dict:
-            return None
-        creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
+    def build_gmail_service(creds: Credentials):
         return build("gmail", "v1", credentials=creds)
 
-    # ---- Email extraction helpers ----
     def extract_text_from_html_data(data_b64):
         try:
             html = base64.urlsafe_b64decode(data_b64).decode("utf-8", errors="ignore")
@@ -88,6 +155,7 @@ def create_app():
                         body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
                     except Exception:
                         body = ""
+
         return body.strip(), sender
 
     def fetch_latest_emails(service, n, recent_window="1d"):
@@ -95,7 +163,6 @@ def create_app():
         res = service.users().messages().list(userId="me", maxResults=n, q=q).execute()
         return res.get("messages", [])
 
-    # ---- Label helpers ----
     def get_or_create_label(service, label_name):
         labels = service.users().labels().list(userId="me").execute().get("labels", [])
         for l in labels:
@@ -116,7 +183,6 @@ def create_app():
             body={"addLabelIds": [label_id], "removeLabelIds": ["UNREAD"]},
         ).execute()
 
-    # ---- Email classifier ----
     def classify_email(content):
         text = content.replace("\n", " ")
         if len(text) > 4000:
@@ -152,7 +218,7 @@ Only reply with one word: marketing or non-marketing.
         except Exception:
             return "non-marketing"
 
-    # -------------------- Routes --------------------
+    # ---- ROUTES ----
     @app.route("/")
     def index():
         authed = bool(session.get("google_creds"))
@@ -164,7 +230,7 @@ Only reply with one word: marketing or non-marketing.
         flow = Flow.from_client_secrets_file(
             client_secrets_file,
             scopes=SCOPES,
-            redirect_uri="http://127.0.0.1:5000/oauth2callback",
+            redirect_uri=url_for("oauth2callback", _external=True),
         )
         auth_url, state = flow.authorization_url(
             access_type="offline",
@@ -177,30 +243,25 @@ Only reply with one word: marketing or non-marketing.
     @app.route("/oauth2callback")
     def oauth2callback():
         state = session.get("state")
-        if not state:
-            # Lost session or expired; redirect to /authorize
-            return redirect(url_for("authorize"))
-
         client_secrets_file = load_client_config()
         flow = Flow.from_client_secrets_file(
             client_secrets_file,
             scopes=SCOPES,
             state=state,
-            redirect_uri="http://127.0.0.1:5000/oauth2callback",
+            redirect_uri=url_for("oauth2callback", _external=True),
         )
-
         flow.fetch_token(authorization_response=request.url)
         creds = flow.credentials
 
-        session["google_creds"] = {
-            "token": creds.token,
-            "refresh_token": creds.refresh_token,
-            "token_uri": creds.token_uri,
-            "client_id": creds.client_id,
-            "client_secret": creds.client_secret,
-            "scopes": creds.scopes,
-            "expiry": creds.expiry.isoformat() if getattr(creds, "expiry", None) else None,
-        }
+        # Get user email from token
+        user_info = creds.id_token
+        user_email = user_info.get("email", f"user_{datetime.now().timestamp()}")
+
+        # Save user credentials to DB
+        save_user_credentials(user_email, creds)
+
+        session["google_creds"] = {"email": user_email}
+
         return redirect(url_for("index"))
 
     @app.route("/logout")
@@ -208,44 +269,37 @@ Only reply with one word: marketing or non-marketing.
         session.pop("google_creds", None)
         return redirect(url_for("index"))
 
-    @app.route("/classify", methods=["POST"])
-    def classify_endpoint():
-        if not session.get("google_creds"):
-            return jsonify({"error": "Not authorized"}), 401
+    # ---- BACKGROUND JOB ----
+    def classify_emails_for_all_users():
+        users = get_all_users()
+        for u in users:
+            try:
+                creds = Credentials.from_authorized_user_info(u, SCOPES)
+                service = build_gmail_service(creds)
+                important_label_id = get_or_create_label(service, IMPORTANT_LABEL)
+                marketing_label_id = get_or_create_label(service, MARKETING_LABEL)
 
-        n = int(request.args.get("n", DEFAULT_MAX_EMAILS))
-        window = request.args.get("window", "1d")
+                msgs = fetch_latest_emails(service, n=5)
+                for m in msgs:
+                    msg_id = m["id"]
+                    body, sender = get_email_body_and_sender(service, msg_id)
+                    label = classify_email(body)
+                    if label == "marketing":
+                        apply_label_and_mark_read(service, msg_id, marketing_label_id)
+                    else:
+                        apply_label_and_mark_read(service, msg_id, important_label_id)
+            except Exception as e:
+                print(f"Error processing {u['email']}: {e}")
 
-        service = build_gmail_service()
-        if not service:
-            return jsonify({"error": "No Gmail credentials"}), 401
-
-        important_label_id = get_or_create_label(service, IMPORTANT_LABEL)
-        marketing_label_id = get_or_create_label(service, MARKETING_LABEL)
-
-        msgs = fetch_latest_emails(service, n, recent_window=window)
-        results = []
-
-        for m in msgs:
-            msg_id = m["id"]
-            body, sender = get_email_body_and_sender(service, msg_id)
-            label = classify_email(body)
-
-            if label == "marketing":
-                apply_label_and_mark_read(service, msg_id, marketing_label_id)
-                results.append({"from": sender, "label": "Marketing Emails"})
-            else:
-                apply_label_and_mark_read(service, msg_id, important_label_id)
-                results.append({"from": sender, "label": "Important Emails"})
-
-        return jsonify({"processed": len(results), "items": results})
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(classify_emails_for_all_users, 'interval', minutes=5)
+    scheduler.start()
 
     return app
 
-# ---- Run app ----
+# ---- APP RUN ----
 app = create_app()
 
 if __name__ == "__main__":
-    # Make sure this is run in the same terminal with:
-    # $env:OAUTHLIB_INSECURE_TRANSPORT=1
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
