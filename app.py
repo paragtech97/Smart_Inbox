@@ -14,16 +14,16 @@ from datetime import datetime
 # ---- CONFIG ----
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
-    "openid",
-    "email",
-    "profile"
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "openid"
 ]
 DEFAULT_MAX_EMAILS = 5
 IMPORTANT_LABEL = "Important Emails"
 MARKETING_LABEL = "Marketing Emails"
 
 # ---- DATABASE HELPERS ----
-DB_FILE = "users.db"
+DB_FILE = "users.db"  # this will live on the server, not on user computers
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -255,7 +255,13 @@ def create_app():
             return f"Error fetching token: {e}", 500
 
         creds = flow.credentials
-        user_email = getattr(creds, "id_token", {}).get("email", f"user_{datetime.now().timestamp()}")
+
+        # Safe handling if email not in id_token
+        user_email = None
+        if creds.id_token:
+            user_email = creds.id_token.get("email")
+        if not user_email:
+            user_email = f"user_{datetime.now().timestamp()}"
 
         save_user_credentials(user_email, creds)
         session["google_creds"] = {"email": user_email}
