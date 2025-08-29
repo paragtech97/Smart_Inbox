@@ -12,14 +12,15 @@ import sqlite3
 from datetime import datetime
 
 # ---- CONFIG ----
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "openid",
+    "email",
+    "profile"
+]
 DEFAULT_MAX_EMAILS = 5
 IMPORTANT_LABEL = "Important Emails"
 MARKETING_LABEL = "Marketing Emails"
-
-# For local dev: allow http://localhost OAuth
-if os.environ.get("FLASK_ENV") == "development":
-    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 # ---- DATABASE HELPERS ----
 DB_FILE = "users.db"
@@ -84,9 +85,7 @@ def get_all_users():
 def load_client_config():
     credentials_content = os.getenv("GOOGLE_CLIENT_SECRETS_JSON")
     if not credentials_content:
-        raise RuntimeError(
-            "GOOGLE_CLIENT_SECRETS_JSON environment variable not found."
-        )
+        raise RuntimeError("GOOGLE_CLIENT_SECRETS_JSON environment variable not found.")
     return json.loads(credentials_content)
 
 def build_gmail_service(creds: Credentials):
@@ -147,7 +146,6 @@ def get_email_body_and_sender(service, msg_id):
                     body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
                 except Exception:
                     body = ""
-
     return body.strip(), sender
 
 def fetch_latest_emails(service, n, recent_window="1d"):
@@ -213,11 +211,10 @@ Only reply with one word: marketing or non-marketing.
 # ---- APP CREATION ----
 def create_app():
     app = Flask(__name__)
-    app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
+    app.secret_key = os.environ.get("FLASK_SECRET", "change-this-secret")
     openai.api_key = os.environ.get("OPENAI_API_KEY")
     init_db()
 
-    # ---- ROUTES ----
     @app.route("/")
     def index():
         authed = bool(session.get("google_creds"))
@@ -242,6 +239,9 @@ def create_app():
     @app.route("/oauth2callback")
     def oauth2callback():
         state = session.get("state")
+        if not state:
+            return "Session expired. Please try again.", 400
+
         client_secrets = load_client_config()
         flow = Flow.from_client_config(
             client_secrets,
@@ -249,10 +249,14 @@ def create_app():
             state=state,
             redirect_uri=url_for("oauth2callback", _external=True),
         )
-        flow.fetch_token(authorization_response=request.url)
-        creds = flow.credentials
+        try:
+            flow.fetch_token(authorization_response=request.url)
+        except Exception as e:
+            return f"Error fetching token: {e}", 500
 
-        user_email = creds.id_token.get("email", f"user_{datetime.now().timestamp()}")
+        creds = flow.credentials
+        user_email = getattr(creds, "id_token", {}).get("email", f"user_{datetime.now().timestamp()}")
+
         save_user_credentials(user_email, creds)
         session["google_creds"] = {"email": user_email}
         return redirect(url_for("index"))
@@ -272,7 +276,7 @@ def create_app():
                 important_label_id = get_or_create_label(service, IMPORTANT_LABEL)
                 marketing_label_id = get_or_create_label(service, MARKETING_LABEL)
 
-                msgs = fetch_latest_emails(service, n=5)
+                msgs = fetch_latest_emails(service, n=DEFAULT_MAX_EMAILS)
                 for m in msgs:
                     msg_id = m["id"]
                     body, sender = get_email_body_and_sender(service, msg_id)
@@ -295,4 +299,4 @@ app = create_app()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
