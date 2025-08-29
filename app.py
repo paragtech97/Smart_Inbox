@@ -1,7 +1,7 @@
 import os
 import json
 import base64
-from flask import Flask, redirect, request, session, url_for, render_template, jsonify
+from flask import Flask, redirect, request, session, url_for, render_template
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -80,115 +80,107 @@ def get_all_users():
         })
     return users
 
-# ---- APP CREATION ----
-def create_app():
-    app = Flask(__name__)
-    app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
-    openai.api_key = os.environ.get("OPENAI_API_KEY")
-    init_db()
-
-    # ---- HELPERS ----
+# ---- HELPERS ----
 def load_client_config():
     credentials_content = os.getenv("GOOGLE_CLIENT_SECRETS_JSON")
     if not credentials_content:
         raise RuntimeError(
-            "GOOGLE_CLIENT_SECRETS_JSON environment variable not found. "
-            "Set it in Render's dashboard for your service."
+            "GOOGLE_CLIENT_SECRETS_JSON environment variable not found."
         )
     return json.loads(credentials_content)
 
-    def build_gmail_service(creds: Credentials):
-        return build("gmail", "v1", credentials=creds)
+def build_gmail_service(creds: Credentials):
+    return build("gmail", "v1", credentials=creds)
 
-    def extract_text_from_html_data(data_b64):
-        try:
-            html = base64.urlsafe_b64decode(data_b64).decode("utf-8", errors="ignore")
-            soup = BeautifulSoup(html, "html.parser")
-            return soup.get_text(separator=" ", strip=True)
-        except Exception:
-            return ""
-
-    def extract_text_from_parts(parts):
-        for part in parts or []:
-            mime = part.get("mimeType", "")
-            body = part.get("body", {}) or {}
-            data = body.get("data")
-            if mime == "text/plain" and data:
-                try:
-                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-                except Exception:
-                    pass
-            if mime == "text/html" and data:
-                txt = extract_text_from_html_data(data)
-                if txt:
-                    return txt
-            if mime.startswith("multipart"):
-                inner = part.get("parts", [])
-                txt = extract_text_from_parts(inner)
-                if txt:
-                    return txt
+def extract_text_from_html_data(data_b64):
+    try:
+        html = base64.urlsafe_b64decode(data_b64).decode("utf-8", errors="ignore")
+        soup = BeautifulSoup(html, "html.parser")
+        return soup.get_text(separator=" ", strip=True)
+    except Exception:
         return ""
 
-    def get_email_body_and_sender(service, msg_id):
-        msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
-        payload = msg.get("payload", {}) or {}
-        headers = payload.get("headers", []) or []
-        parts = payload.get("parts", []) or []
+def extract_text_from_parts(parts):
+    for part in parts or []:
+        mime = part.get("mimeType", "")
+        body = part.get("body", {}) or {}
+        data = body.get("data")
+        if mime == "text/plain" and data:
+            try:
+                return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+        if mime == "text/html" and data:
+            txt = extract_text_from_html_data(data)
+            if txt:
+                return txt
+        if mime.startswith("multipart"):
+            inner = part.get("parts", [])
+            txt = extract_text_from_parts(inner)
+            if txt:
+                return txt
+    return ""
 
-        sender = "Unknown"
-        for h in headers:
-            if h.get("name", "").lower() == "from":
-                sender = h.get("value", "Unknown")
-                break
+def get_email_body_and_sender(service, msg_id):
+    msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    payload = msg.get("payload", {}) or {}
+    headers = payload.get("headers", []) or []
+    parts = payload.get("parts", []) or []
 
-        body = ""
-        if parts:
-            body = extract_text_from_parts(parts)
-        else:
-            mime_type = payload.get("mimeType", "")
-            data = (payload.get("body") or {}).get("data")
-            if data:
-                if mime_type == "text/html":
-                    body = extract_text_from_html_data(data)
-                else:
-                    try:
-                        body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-                    except Exception:
-                        body = ""
+    sender = "Unknown"
+    for h in headers:
+        if h.get("name", "").lower() == "from":
+            sender = h.get("value", "Unknown")
+            break
 
-        return body.strip(), sender
+    body = ""
+    if parts:
+        body = extract_text_from_parts(parts)
+    else:
+        mime_type = payload.get("mimeType", "")
+        data = (payload.get("body") or {}).get("data")
+        if data:
+            if mime_type == "text/html":
+                body = extract_text_from_html_data(data)
+            else:
+                try:
+                    body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                except Exception:
+                    body = ""
 
-    def fetch_latest_emails(service, n, recent_window="1d"):
-        q = f"is:unread newer_than:{recent_window}"
-        res = service.users().messages().list(userId="me", maxResults=n, q=q).execute()
-        return res.get("messages", [])
+    return body.strip(), sender
 
-    def get_or_create_label(service, label_name):
-        labels = service.users().labels().list(userId="me").execute().get("labels", [])
-        for l in labels:
-            if l["name"].lower() == label_name.lower():
-                return l["id"]
-        body = {
-            "name": label_name,
-            "labelListVisibility": "labelShow",
-            "messageListVisibility": "show",
-        }
-        label = service.users().labels().create(userId="me", body=body).execute()
-        return label["id"]
+def fetch_latest_emails(service, n, recent_window="1d"):
+    q = f"is:unread newer_than:{recent_window}"
+    res = service.users().messages().list(userId="me", maxResults=n, q=q).execute()
+    return res.get("messages", [])
 
-    def apply_label_and_mark_read(service, msg_id, label_id):
-        service.users().messages().modify(
-            userId="me",
-            id=msg_id,
-            body={"addLabelIds": [label_id], "removeLabelIds": ["UNREAD"]},
-        ).execute()
+def get_or_create_label(service, label_name):
+    labels = service.users().labels().list(userId="me").execute().get("labels", [])
+    for l in labels:
+        if l["name"].lower() == label_name.lower():
+            return l["id"]
+    body = {
+        "name": label_name,
+        "labelListVisibility": "labelShow",
+        "messageListVisibility": "show",
+    }
+    label = service.users().labels().create(userId="me", body=body).execute()
+    return label["id"]
 
-    def classify_email(content):
-        text = content.replace("\n", " ")
-        if len(text) > 4000:
-            text = text[:4000]
+def apply_label_and_mark_read(service, msg_id, label_id):
+    service.users().messages().modify(
+        userId="me",
+        id=msg_id,
+        body={"addLabelIds": [label_id], "removeLabelIds": ["UNREAD"]},
+    ).execute()
 
-        prompt = f"""
+def classify_email(content):
+    text = content.replace("\n", " ")
+    if len(text) > 4000:
+        text = text[:4000]
+
+    prompt = f"""
 Classify the email content as 'marketing' or 'non-marketing'.
 
 Rules:
@@ -200,23 +192,30 @@ Email:
 
 Only reply with one word: marketing or non-marketing.
 """
-        messages = [
-            {"role": "system", "content": "You are a precise email classifier. Reply only 'marketing' or 'non-marketing'."},
-            {"role": "user", "content": prompt},
-        ]
-        try:
-            resp = openai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                max_tokens=4,
-                temperature=0,
-            )
-            label_raw = resp.choices[0].message.content.strip().lower()
-            if "marketing" in label_raw:
-                return "marketing"
-            return "non-marketing"
-        except Exception:
-            return "non-marketing"
+    messages = [
+        {"role": "system", "content": "You are a precise email classifier. Reply only 'marketing' or 'non-marketing'."},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        resp = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=4,
+            temperature=0,
+        )
+        label_raw = resp.choices[0].message.content.strip().lower()
+        if "marketing" in label_raw:
+            return "marketing"
+        return "non-marketing"
+    except Exception:
+        return "non-marketing"
+
+# ---- APP CREATION ----
+def create_app():
+    app = Flask(__name__)
+    app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
+    openai.api_key = os.environ.get("OPENAI_API_KEY")
+    init_db()
 
     # ---- ROUTES ----
     @app.route("/")
@@ -226,9 +225,9 @@ Only reply with one word: marketing or non-marketing.
 
     @app.route("/authorize")
     def authorize():
-        client_secrets_file = load_client_config()
-        flow = Flow.from_client_secrets_file(
-            client_secrets_file,
+        client_secrets = load_client_config()
+        flow = Flow.from_client_config(
+            client_secrets,
             scopes=SCOPES,
             redirect_uri=url_for("oauth2callback", _external=True),
         )
@@ -243,9 +242,9 @@ Only reply with one word: marketing or non-marketing.
     @app.route("/oauth2callback")
     def oauth2callback():
         state = session.get("state")
-        client_secrets_file = load_client_config()
-        flow = Flow.from_client_secrets_file(
-            client_secrets_file,
+        client_secrets = load_client_config()
+        flow = Flow.from_client_config(
+            client_secrets,
             scopes=SCOPES,
             state=state,
             redirect_uri=url_for("oauth2callback", _external=True),
@@ -253,15 +252,9 @@ Only reply with one word: marketing or non-marketing.
         flow.fetch_token(authorization_response=request.url)
         creds = flow.credentials
 
-        # Get user email from token
-        user_info = creds.id_token
-        user_email = user_info.get("email", f"user_{datetime.now().timestamp()}")
-
-        # Save user credentials to DB
+        user_email = creds.id_token.get("email", f"user_{datetime.now().timestamp()}")
         save_user_credentials(user_email, creds)
-
         session["google_creds"] = {"email": user_email}
-
         return redirect(url_for("index"))
 
     @app.route("/logout")
