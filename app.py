@@ -256,11 +256,12 @@ def create_app():
 
         creds = flow.credentials
 
-        # Safe handling if email not in id_token
+        # Safe handling for email
         user_email = None
-        if creds.id_token:
+        if isinstance(creds.id_token, dict):
             user_email = creds.id_token.get("email")
         if not user_email:
+            # fallback if id_token is str or email is missing
             user_email = f"user_{datetime.now().timestamp()}"
 
         save_user_credentials(user_email, creds)
