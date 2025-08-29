@@ -22,8 +22,8 @@ DEFAULT_MAX_EMAILS = 5
 IMPORTANT_LABEL = "Important Emails"
 MARKETING_LABEL = "Marketing Emails"
 
-# ---- DATABASE HELPERS ----
-DB_FILE = "users.db"  # this will live on the server, not on user computers
+# ---- DATABASE ----
+DB_FILE = "users.db"  # stored on server
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -208,7 +208,7 @@ Only reply with one word: marketing or non-marketing.
     except Exception:
         return "non-marketing"
 
-# ---- APP CREATION ----
+# ---- APP ----
 def create_app():
     app = Flask(__name__)
     app.secret_key = os.environ.get("FLASK_SECRET", "change-this-secret")
@@ -256,12 +256,11 @@ def create_app():
 
         creds = flow.credentials
 
-        # Safe handling for email
+        # Handle email safely
         user_email = None
         if isinstance(creds.id_token, dict):
             user_email = creds.id_token.get("email")
         if not user_email:
-            # fallback if id_token is str or email is missing
             user_email = f"user_{datetime.now().timestamp()}"
 
         save_user_credentials(user_email, creds)
@@ -273,7 +272,7 @@ def create_app():
         session.pop("google_creds", None)
         return redirect(url_for("index"))
 
-    # ---- BACKGROUND JOB ----
+    # ---- AUTO BACKGROUND JOB ----
     def classify_emails_for_all_users():
         users = get_all_users()
         for u in users:
@@ -286,7 +285,7 @@ def create_app():
                 msgs = fetch_latest_emails(service, n=DEFAULT_MAX_EMAILS)
                 for m in msgs:
                     msg_id = m["id"]
-                    body, sender = get_email_body_and_sender(service, msg_id)
+                    body, _ = get_email_body_and_sender(service, msg_id)
                     label = classify_email(body)
                     if label == "marketing":
                         apply_label_and_mark_read(service, msg_id, marketing_label_id)
@@ -301,7 +300,7 @@ def create_app():
 
     return app
 
-# ---- APP RUN ----
+# ---- RUN APP ----
 app = create_app()
 
 if __name__ == "__main__":
