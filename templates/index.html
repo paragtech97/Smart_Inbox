@@ -3,32 +3,91 @@
 <head>
     <meta charset="UTF-8">
     <title>SmartInbox</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
+        /* Reset and basic styling */
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
         body {
-            font-family: Arial, sans-serif;
-            padding: 40px;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background-color: #f4f4f4;
             color: #333;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
         }
+
         .container {
-            max-width: 600px;
-            margin: auto;
+            width: 100%;
+            max-width: 500px;
             background: #fff;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 0 15px rgba(0,0,0,0.1);
+            padding: 30px 25px;
+            border-radius: 12px;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+            text-align: center;
         }
+
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 15px;
+            color: #007bff;
+        }
+
+        p {
+            font-size: 1rem;
+            margin-bottom: 20px;
+        }
+
         a.button {
             display: inline-block;
-            margin-top: 20px;
-            padding: 10px 20px;
+            padding: 12px 25px;
             background: #007bff;
             color: #fff;
             text-decoration: none;
-            border-radius: 5px;
+            font-weight: bold;
+            border-radius: 6px;
+            transition: all 0.2s ease-in-out;
         }
+
         a.button:hover {
             background: #0056b3;
+            transform: translateY(-2px);
+        }
+
+        .info {
+            font-size: 0.9rem;
+            color: #666;
+            margin-top: 15px;
+        }
+
+        .status {
+            margin-top: 10px;
+            padding: 8px 12px;
+            background: #e9f0ff;
+            color: #0056b3;
+            border-radius: 5px;
+            display: inline-block;
+            font-size: 0.9rem;
+        }
+
+        /* Mobile tweaks */
+        @media (max-width: 480px) {
+            h1 {
+                font-size: 1.6rem;
+            }
+            .container {
+                padding: 25px 20px;
+            }
+            a.button {
+                width: 100%;
+                padding: 12px 0;
+            }
         }
     </style>
 </head>
@@ -38,12 +97,42 @@
 
         {% if authed %}
             <p>Welcome! You are authorized with Google.</p>
-            <p>Your emails will be classified automatically every few minutes.</p>
+            <p>Your emails will be classified automatically in the background.</p>
             <a class="button" href="{{ url_for('logout') }}">Logout</a>
+
+            <div class="status" id="last-classified">Checking status...</div>
+            <div class="info">Page will automatically refresh the status every 30 seconds.</div>
+
         {% else %}
             <p>Please authorize SmartInbox to access your Gmail to start automatic email classification.</p>
             <a class="button" href="{{ url_for('authorize') }}">Login with Google</a>
         {% endif %}
     </div>
+
+    {% if authed %}
+    <script>
+        async function fetchStatus() {
+            try {
+                // Request last classification time from the server
+                const res = await fetch('/last-classified');
+                if (res.ok) {
+                    const data = await res.json();
+                    document.getElementById('last-classified').textContent = 
+                        data.last_classified 
+                        ? `Last classified at: ${new Date(data.last_classified).toLocaleString()}` 
+                        : 'Classification has not run yet.';
+                } else {
+                    document.getElementById('last-classified').textContent = 'Could not fetch status';
+                }
+            } catch (err) {
+                document.getElementById('last-classified').textContent = 'Error fetching status';
+            }
+        }
+
+        fetchStatus();
+        setInterval(fetchStatus, 30000); // update every 30 seconds
+    </script>
+    {% endif %}
 </body>
 </html>
+git commit -m "Update index.html with mobile-friendly design"
