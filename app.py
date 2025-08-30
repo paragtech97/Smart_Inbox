@@ -95,7 +95,12 @@ def extract_text_from_html_data(data_b64):
     try:
         html = base64.urlsafe_b64decode(data_b64).decode("utf-8", errors="ignore")
         soup = BeautifulSoup(html, "html.parser")
-        return soup.get_text(separator=" ", strip=True)
+        text = soup.get_text(separator=" ", strip=True)
+        # Include alt text from images
+        for img in soup.find_all("img"):
+            if img.has_attr("alt"):
+                text += " " + img["alt"]
+        return text
     except Exception:
         return ""
 
@@ -127,10 +132,13 @@ def get_email_body_and_sender(service, msg_id):
     parts = payload.get("parts", []) or []
 
     sender = "Unknown"
+    subject = "No Subject"
     for h in headers:
-        if h.get("name", "").lower() == "from":
+        name = h.get("name", "").lower()
+        if name == "from":
             sender = h.get("value", "Unknown")
-            break
+        elif name == "subject":
+            subject = h.get("value", "No Subject")
 
     body = ""
     if parts:
@@ -146,7 +154,7 @@ def get_email_body_and_sender(service, msg_id):
                     body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
                 except Exception:
                     body = ""
-    return body.strip(), sender
+    return body.strip(), sender, subject
 
 def fetch_latest_emails(service, n, recent_window="1d"):
     q = f"is:unread newer_than:{recent_window}"
@@ -173,25 +181,30 @@ def apply_label_and_mark_read(service, msg_id, label_id):
         body={"addLabelIds": [label_id], "removeLabelIds": ["UNREAD"]},
     ).execute()
 
-def classify_email(content):
+# ---- GPT CLASSIFIER ----
+def classify_email(content, sender="", subject=""):
     text = content.replace("\n", " ")
     if len(text) > 4000:
         text = text[:4000]
 
     prompt = f"""
-Classify the email content as 'marketing' or 'non-marketing'.
+Classify the email strictly as 'marketing' or 'important'.
 
-Rules:
-- Promotional content, event invites, upgrades, discounts, newsletters → marketing
-- Receipts, order/delivery updates, invoices, meeting/calendar info, personal/team updates → non-marketing
+Metadata:
+- Sender: {sender}
+- Subject: {subject}
 
-Email:
+Email content:
 \"\"\"{text}\"\"\"
 
-Only reply with one word: marketing or non-marketing.
+Rules:
+- Marketing: promotional, newsletters, discounts, ads.
+- Important: receipts, order updates, invoices, personal/team messages, meetings.
+
+Reply ONLY with 'marketing' or 'important'.
 """
     messages = [
-        {"role": "system", "content": "You are a precise email classifier. Reply only 'marketing' or 'non-marketing'."},
+        {"role": "system", "content": "You are a precise email classifier. Reply only 'marketing' or 'important'."},
         {"role": "user", "content": prompt},
     ]
     try:
@@ -204,9 +217,9 @@ Only reply with one word: marketing or non-marketing.
         label_raw = resp.choices[0].message.content.strip().lower()
         if "marketing" in label_raw:
             return "marketing"
-        return "non-marketing"
+        return "important"
     except Exception:
-        return "non-marketing"
+        return "important"
 
 # ---- APP ----
 def create_app():
@@ -255,8 +268,6 @@ def create_app():
             return f"Error fetching token: {e}", 500
 
         creds = flow.credentials
-
-        # Handle email safely
         user_email = None
         if isinstance(creds.id_token, dict):
             user_email = creds.id_token.get("email")
@@ -285,8 +296,8 @@ def create_app():
                 msgs = fetch_latest_emails(service, n=DEFAULT_MAX_EMAILS)
                 for m in msgs:
                     msg_id = m["id"]
-                    body, _ = get_email_body_and_sender(service, msg_id)
-                    label = classify_email(body)
+                    body, sender, subject = get_email_body_and_sender(service, msg_id)
+                    label = classify_email(body, sender, subject)
                     if label == "marketing":
                         apply_label_and_mark_read(service, msg_id, marketing_label_id)
                     else:
