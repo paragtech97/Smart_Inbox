@@ -18,12 +18,11 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "openid"
 ]
-DEFAULT_MAX_EMAILS = 5
 IMPORTANT_LABEL = "Important Emails"
 MARKETING_LABEL = "Marketing Emails"
 
 # ---- DATABASE ----
-DB_FILE = "users.db"  # stored on server
+DB_FILE = "users.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -95,12 +94,7 @@ def extract_text_from_html_data(data_b64):
     try:
         html = base64.urlsafe_b64decode(data_b64).decode("utf-8", errors="ignore")
         soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(separator=" ", strip=True)
-        # Include alt text from images
-        for img in soup.find_all("img"):
-            if img.has_attr("alt"):
-                text += " " + img["alt"]
-        return text
+        return soup.get_text(separator=" ", strip=True)
     except Exception:
         return ""
 
@@ -137,7 +131,7 @@ def get_email_body_and_sender(service, msg_id):
         name = h.get("name", "").lower()
         if name == "from":
             sender = h.get("value", "Unknown")
-        elif name == "subject":
+        if name == "subject":
             subject = h.get("value", "No Subject")
 
     body = ""
@@ -156,10 +150,21 @@ def get_email_body_and_sender(service, msg_id):
                     body = ""
     return body.strip(), sender, subject
 
-def fetch_latest_emails(service, n, recent_window="1d"):
-    q = f"is:unread newer_than:{recent_window}"
-    res = service.users().messages().list(userId="me", maxResults=n, q=q).execute()
-    return res.get("messages", [])
+def fetch_unread_emails_today(service):
+    today = datetime.utcnow().date()
+    query = f"is:unread after:{today.strftime('%Y/%m/%d')}"
+    all_msgs = []
+    page_token = None
+    while True:
+        res = service.users().messages().list(
+            userId="me", q=query, pageToken=page_token, maxResults=500
+        ).execute()
+        msgs = res.get("messages", [])
+        all_msgs.extend(msgs)
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return all_msgs
 
 def get_or_create_label(service, label_name):
     labels = service.users().labels().list(userId="me").execute().get("labels", [])
@@ -181,25 +186,23 @@ def apply_label_and_mark_read(service, msg_id, label_id):
         body={"addLabelIds": [label_id], "removeLabelIds": ["UNREAD"]},
     ).execute()
 
-# ---- GPT CLASSIFIER ----
-def classify_email(content, sender="", subject=""):
+def classify_email(content, subject="", sender=""):
     text = content.replace("\n", " ")
     if len(text) > 4000:
         text = text[:4000]
 
     prompt = f"""
-Classify the email strictly as 'marketing' or 'important'.
+Classify the email as 'marketing' or 'important'.
 
-Metadata:
-- Sender: {sender}
-- Subject: {subject}
+Sender: {sender}
+Subject: {subject}
+
+Rules:
+- Marketing: promotional, event invites, newsletters, discounts, deals, ads.
+- Important: receipts, order/delivery updates, invoices, personal/team messages, meetings.
 
 Email content:
 \"\"\"{text}\"\"\"
-
-Rules:
-- Marketing: promotional, newsletters, discounts, ads.
-- Important: receipts, order updates, invoices, personal/team messages, meetings.
 
 Reply ONLY with 'marketing' or 'important'.
 """
@@ -268,9 +271,7 @@ def create_app():
             return f"Error fetching token: {e}", 500
 
         creds = flow.credentials
-        user_email = None
-        if isinstance(creds.id_token, dict):
-            user_email = creds.id_token.get("email")
+        user_email = creds.id_token if isinstance(creds.id_token, str) else creds.id_token.get("email", None)
         if not user_email:
             user_email = f"user_{datetime.now().timestamp()}"
 
@@ -283,7 +284,7 @@ def create_app():
         session.pop("google_creds", None)
         return redirect(url_for("index"))
 
-    # ---- AUTO BACKGROUND JOB ----
+    # ---- BACKGROUND JOB ----
     def classify_emails_for_all_users():
         users = get_all_users()
         for u in users:
@@ -293,15 +294,16 @@ def create_app():
                 important_label_id = get_or_create_label(service, IMPORTANT_LABEL)
                 marketing_label_id = get_or_create_label(service, MARKETING_LABEL)
 
-                msgs = fetch_latest_emails(service, n=DEFAULT_MAX_EMAILS)
+                msgs = fetch_unread_emails_today(service)
                 for m in msgs:
                     msg_id = m["id"]
                     body, sender, subject = get_email_body_and_sender(service, msg_id)
-                    label = classify_email(body, sender, subject)
+                    label = classify_email(body, subject=subject, sender=sender)
                     if label == "marketing":
                         apply_label_and_mark_read(service, msg_id, marketing_label_id)
                     else:
                         apply_label_and_mark_read(service, msg_id, important_label_id)
+
             except Exception as e:
                 print(f"Error processing {u['email']}: {e}")
 
@@ -317,3 +319,4 @@ app = create_app()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+    
