@@ -1,7 +1,7 @@
 import os
 import json
 import base64
-from flask import Flask, redirect, request, session, url_for, render_template
+from flask import Flask, redirect, request, session, url_for, render_template, jsonify
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -18,11 +18,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "openid"
 ]
+
 IMPORTANT_LABEL = "Important Emails"
 MARKETING_LABEL = "Marketing Emails"
 
 # ---- DATABASE ----
-DB_FILE = "users.db"
+DB_FILE = "users.db"  # stored on server
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -126,13 +127,10 @@ def get_email_body_and_sender(service, msg_id):
     parts = payload.get("parts", []) or []
 
     sender = "Unknown"
-    subject = "No Subject"
     for h in headers:
-        name = h.get("name", "").lower()
-        if name == "from":
+        if h.get("name", "").lower() == "from":
             sender = h.get("value", "Unknown")
-        if name == "subject":
-            subject = h.get("value", "No Subject")
+            break
 
     body = ""
     if parts:
@@ -148,23 +146,12 @@ def get_email_body_and_sender(service, msg_id):
                     body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
                 except Exception:
                     body = ""
-    return body.strip(), sender, subject
+    return body.strip(), sender
 
-def fetch_unread_emails_today(service):
-    today = datetime.utcnow().date()
-    query = f"is:unread after:{today.strftime('%Y/%m/%d')}"
-    all_msgs = []
-    page_token = None
-    while True:
-        res = service.users().messages().list(
-            userId="me", q=query, pageToken=page_token, maxResults=500
-        ).execute()
-        msgs = res.get("messages", [])
-        all_msgs.extend(msgs)
-        page_token = res.get("nextPageToken")
-        if not page_token:
-            break
-    return all_msgs
+def fetch_all_unread_emails(service):
+    """Fetch all unread emails (no limit)."""
+    res = service.users().messages().list(userId="me", q="is:unread").execute()
+    return res.get("messages", [])
 
 def get_or_create_label(service, label_name):
     labels = service.users().labels().list(userId="me").execute().get("labels", [])
@@ -186,25 +173,22 @@ def apply_label_and_mark_read(service, msg_id, label_id):
         body={"addLabelIds": [label_id], "removeLabelIds": ["UNREAD"]},
     ).execute()
 
-def classify_email(content, subject="", sender=""):
+def classify_email(content):
     text = content.replace("\n", " ")
     if len(text) > 4000:
         text = text[:4000]
 
     prompt = f"""
-Classify the email as 'marketing' or 'important'.
-
-Sender: {sender}
-Subject: {subject}
+Classify the email content as 'marketing' or 'important'.
 
 Rules:
-- Marketing: promotional, event invites, newsletters, discounts, deals, ads.
-- Important: receipts, order/delivery updates, invoices, personal/team messages, meetings.
+- Promotional content, ads, event invites, upgrades, discounts, newsletters → marketing
+- Receipts, order/delivery updates, invoices, meeting/calendar info, personal/team updates → important
 
-Email content:
+Email:
 \"\"\"{text}\"\"\"
 
-Reply ONLY with 'marketing' or 'important'.
+Only reply with one word: marketing or important.
 """
     messages = [
         {"role": "system", "content": "You are a precise email classifier. Reply only 'marketing' or 'important'."},
@@ -230,6 +214,9 @@ def create_app():
     app.secret_key = os.environ.get("FLASK_SECRET", "change-this-secret")
     openai.api_key = os.environ.get("OPENAI_API_KEY")
     init_db()
+
+    global last_classification_time
+    last_classification_time = None
 
     @app.route("/")
     def index():
@@ -271,10 +258,7 @@ def create_app():
             return f"Error fetching token: {e}", 500
 
         creds = flow.credentials
-        user_email = creds.id_token if isinstance(creds.id_token, str) else creds.id_token.get("email", None)
-        if not user_email:
-            user_email = f"user_{datetime.now().timestamp()}"
-
+        user_email = creds.id_token.get("email") if isinstance(creds.id_token, dict) else f"user_{datetime.now().timestamp()}"
         save_user_credentials(user_email, creds)
         session["google_creds"] = {"email": user_email}
         return redirect(url_for("index"))
@@ -284,8 +268,15 @@ def create_app():
         session.pop("google_creds", None)
         return redirect(url_for("index"))
 
+    @app.route("/last-classified")
+    def last_classified():
+        if last_classification_time:
+            return jsonify({'last_classified': last_classification_time.isoformat()})
+        return jsonify({'last_classified': None})
+
     # ---- BACKGROUND JOB ----
     def classify_emails_for_all_users():
+        global last_classification_time
         users = get_all_users()
         for u in users:
             try:
@@ -294,18 +285,18 @@ def create_app():
                 important_label_id = get_or_create_label(service, IMPORTANT_LABEL)
                 marketing_label_id = get_or_create_label(service, MARKETING_LABEL)
 
-                msgs = fetch_unread_emails_today(service)
+                msgs = fetch_all_unread_emails(service)
                 for m in msgs:
                     msg_id = m["id"]
-                    body, sender, subject = get_email_body_and_sender(service, msg_id)
-                    label = classify_email(body, subject=subject, sender=sender)
+                    body, _ = get_email_body_and_sender(service, msg_id)
+                    label = classify_email(body)
                     if label == "marketing":
                         apply_label_and_mark_read(service, msg_id, marketing_label_id)
                     else:
                         apply_label_and_mark_read(service, msg_id, important_label_id)
-
             except Exception as e:
                 print(f"Error processing {u['email']}: {e}")
+        last_classification_time = datetime.utcnow()
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(classify_emails_for_all_users, 'interval', minutes=5)
@@ -319,4 +310,3 @@ app = create_app()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-    
