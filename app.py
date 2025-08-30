@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 import openai
 from apscheduler.schedulers.background import BackgroundScheduler
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ---- CONFIG ----
 SCOPES = [
@@ -148,9 +148,11 @@ def get_email_body_and_sender(service, msg_id):
                     body = ""
     return body.strip(), sender
 
-def fetch_all_unread_emails(service):
-    """Fetch all unread emails (no limit)."""
-    res = service.users().messages().list(userId="me", q="is:unread").execute()
+def fetch_all_unread_emails_today(service):
+    today = datetime.utcnow().date()
+    # Gmail query for unread emails from today
+    q = f"is:unread after:{today.isoformat()}"
+    res = service.users().messages().list(userId="me", q=q).execute()
     return res.get("messages", [])
 
 def get_or_create_label(service, label_name):
@@ -179,19 +181,19 @@ def classify_email(content):
         text = text[:4000]
 
     prompt = f"""
-Classify the email content as 'marketing' or 'important'.
+Classify the email content as 'marketing' or 'non-marketing'.
 
 Rules:
-- Promotional content, ads, event invites, upgrades, discounts, newsletters → marketing
-- Receipts, order/delivery updates, invoices, meeting/calendar info, personal/team updates → important
+- Promotional content, event invites, upgrades, discounts, newsletters → marketing
+- Receipts, order/delivery updates, invoices, meeting/calendar info, personal/team updates → non-marketing
 
 Email:
 \"\"\"{text}\"\"\"
 
-Only reply with one word: marketing or important.
+Only reply with one word: marketing or non-marketing.
 """
     messages = [
-        {"role": "system", "content": "You are a precise email classifier. Reply only 'marketing' or 'important'."},
+        {"role": "system", "content": "You are a precise email classifier. Reply only 'marketing' or 'non-marketing'."},
         {"role": "user", "content": prompt},
     ]
     try:
@@ -204,19 +206,18 @@ Only reply with one word: marketing or important.
         label_raw = resp.choices[0].message.content.strip().lower()
         if "marketing" in label_raw:
             return "marketing"
-        return "important"
+        return "non-marketing"
     except Exception:
-        return "important"
+        return "non-marketing"
 
 # ---- APP ----
+last_classified_time = None  # Global variable to track last classification
+
 def create_app():
     app = Flask(__name__)
     app.secret_key = os.environ.get("FLASK_SECRET", "change-this-secret")
     openai.api_key = os.environ.get("OPENAI_API_KEY")
     init_db()
-
-    global last_classification_time
-    last_classification_time = None
 
     @app.route("/")
     def index():
@@ -258,7 +259,12 @@ def create_app():
             return f"Error fetching token: {e}", 500
 
         creds = flow.credentials
-        user_email = creds.id_token.get("email") if isinstance(creds.id_token, dict) else f"user_{datetime.now().timestamp()}"
+        user_email = None
+        if isinstance(creds.id_token, dict):
+            user_email = creds.id_token.get("email")
+        if not user_email:
+            user_email = f"user_{datetime.now().timestamp()}"
+
         save_user_credentials(user_email, creds)
         session["google_creds"] = {"email": user_email}
         return redirect(url_for("index"))
@@ -268,15 +274,16 @@ def create_app():
         session.pop("google_creds", None)
         return redirect(url_for("index"))
 
+    # Endpoint for HTML to fetch last classified time
     @app.route("/last-classified")
     def last_classified():
-        if last_classification_time:
-            return jsonify({'last_classified': last_classification_time.isoformat()})
-        return jsonify({'last_classified': None})
+        return jsonify({
+            "last_classified": last_classified_time.isoformat() if last_classified_time else None
+        })
 
     # ---- BACKGROUND JOB ----
     def classify_emails_for_all_users():
-        global last_classification_time
+        global last_classified_time
         users = get_all_users()
         for u in users:
             try:
@@ -285,7 +292,7 @@ def create_app():
                 important_label_id = get_or_create_label(service, IMPORTANT_LABEL)
                 marketing_label_id = get_or_create_label(service, MARKETING_LABEL)
 
-                msgs = fetch_all_unread_emails(service)
+                msgs = fetch_all_unread_emails_today(service)
                 for m in msgs:
                     msg_id = m["id"]
                     body, _ = get_email_body_and_sender(service, msg_id)
@@ -296,7 +303,8 @@ def create_app():
                         apply_label_and_mark_read(service, msg_id, important_label_id)
             except Exception as e:
                 print(f"Error processing {u['email']}: {e}")
-        last_classification_time = datetime.utcnow()
+
+        last_classified_time = datetime.utcnow()
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(classify_emails_for_all_users, 'interval', minutes=5)
