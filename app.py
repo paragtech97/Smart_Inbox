@@ -22,9 +22,9 @@ SCOPES = [
 IMPORTANT_LABEL = "Important Emails"
 MARKETING_LABEL = "Marketing Emails"
 
-# ---- DATABASE ----
-DB_FILE = "users.db"  # stored on server
+DB_FILE = "users.db"
 
+# ---- DATABASE ----
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -40,15 +40,19 @@ def init_db():
             expiry TEXT
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS status (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
 
 def save_user_credentials(email, creds: Credentials):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''
-        INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?,?,?)
-    ''', (
+    c.execute('''INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?,?,?)''', (
         email,
         creds.token,
         creds.refresh_token,
@@ -80,6 +84,21 @@ def get_all_users():
             "expiry": row[7]
         })
     return users
+
+def save_last_classified(timestamp):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO status VALUES (?,?)', ("last_classified", timestamp))
+    conn.commit()
+    conn.close()
+
+def get_last_classified():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT value FROM status WHERE key=?', ("last_classified",))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 # ---- HELPERS ----
 def load_client_config():
@@ -127,10 +146,13 @@ def get_email_body_and_sender(service, msg_id):
     parts = payload.get("parts", []) or []
 
     sender = "Unknown"
+    subject = ""
     for h in headers:
-        if h.get("name", "").lower() == "from":
+        name = h.get("name", "").lower()
+        if name == "from":
             sender = h.get("value", "Unknown")
-            break
+        if name == "subject":
+            subject = h.get("value", "")
 
     body = ""
     if parts:
@@ -146,13 +168,13 @@ def get_email_body_and_sender(service, msg_id):
                     body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
                 except Exception:
                     body = ""
-    return body.strip(), sender
+    return body.strip(), sender, subject
 
-def fetch_all_unread_emails_today(service):
+def fetch_today_unread_emails(service):
+    # only emails from today
     today = datetime.utcnow().date()
-    # Gmail query for unread emails from today
     q = f"is:unread after:{today.isoformat()}"
-    res = service.users().messages().list(userId="me", q=q).execute()
+    res = service.users().messages().list(userId="me", q=q, maxResults=500).execute()
     return res.get("messages", [])
 
 def get_or_create_label(service, label_name):
@@ -175,27 +197,31 @@ def apply_label_and_mark_read(service, msg_id, label_id):
         body={"addLabelIds": [label_id], "removeLabelIds": ["UNREAD"]},
     ).execute()
 
-def classify_email(content):
-    text = content.replace("\n", " ")
+# ---- GPT CLASSIFIER ----
+def classify_email(content, subject=""):
+    text = (subject + " " + content).replace("\n", " ")
     if len(text) > 4000:
         text = text[:4000]
 
     prompt = f"""
-Classify the email content as 'marketing' or 'non-marketing'.
+Classify the email as either 'marketing' or 'important'.
 
 Rules:
-- Promotional content, event invites, upgrades, discounts, newsletters → marketing
-- Receipts, order/delivery updates, invoices, meeting/calendar info, personal/team updates → non-marketing
+- 'Important' = urgent, personal, or directly relevant to you.
+- 'Marketing' = newsletters, digests, blog posts, educational updates from companies, promotional emails, or content that is not directly actionable or time-sensitive.
+- Do not misclassify company educational content as important.
 
-Email:
+Email Subject + Content:
 \"\"\"{text}\"\"\"
 
-Only reply with one word: marketing or non-marketing.
+Reply ONLY with one word: marketing or important.
 """
+
     messages = [
-        {"role": "system", "content": "You are a precise email classifier. Reply only 'marketing' or 'non-marketing'."},
-        {"role": "user", "content": prompt},
+        {"role": "system", "content": "You are an expert email classifier."},
+        {"role": "user", "content": prompt}
     ]
+
     try:
         resp = openai.chat.completions.create(
             model="gpt-4o-mini",
@@ -206,13 +232,11 @@ Only reply with one word: marketing or non-marketing.
         label_raw = resp.choices[0].message.content.strip().lower()
         if "marketing" in label_raw:
             return "marketing"
-        return "non-marketing"
+        return "important"
     except Exception:
-        return "non-marketing"
+        return "marketing"  # fail-safe
 
-# ---- APP ----
-last_classified_time = None  # Global variable to track last classification
-
+# ---- FLASK APP ----
 def create_app():
     app = Flask(__name__)
     app.secret_key = os.environ.get("FLASK_SECRET", "change-this-secret")
@@ -230,12 +254,12 @@ def create_app():
         flow = Flow.from_client_config(
             client_secrets,
             scopes=SCOPES,
-            redirect_uri=url_for("oauth2callback", _external=True),
+            redirect_uri=url_for("oauth2callback", _external=True)
         )
         auth_url, state = flow.authorization_url(
             access_type="offline",
             include_granted_scopes="true",
-            prompt="consent",
+            prompt="consent"
         )
         session["state"] = state
         return redirect(auth_url)
@@ -251,14 +275,11 @@ def create_app():
             client_secrets,
             scopes=SCOPES,
             state=state,
-            redirect_uri=url_for("oauth2callback", _external=True),
+            redirect_uri=url_for("oauth2callback", _external=True)
         )
-        try:
-            flow.fetch_token(authorization_response=request.url)
-        except Exception as e:
-            return f"Error fetching token: {e}", 500
-
+        flow.fetch_token(authorization_response=request.url)
         creds = flow.credentials
+
         user_email = None
         if isinstance(creds.id_token, dict):
             user_email = creds.id_token.get("email")
@@ -274,16 +295,13 @@ def create_app():
         session.pop("google_creds", None)
         return redirect(url_for("index"))
 
-    # Endpoint for HTML to fetch last classified time
     @app.route("/last-classified")
     def last_classified():
-        return jsonify({
-            "last_classified": last_classified_time.isoformat() if last_classified_time else None
-        })
+        ts = get_last_classified()
+        return jsonify({"last_classified": ts})
 
     # ---- BACKGROUND JOB ----
     def classify_emails_for_all_users():
-        global last_classified_time
         users = get_all_users()
         for u in users:
             try:
@@ -292,11 +310,11 @@ def create_app():
                 important_label_id = get_or_create_label(service, IMPORTANT_LABEL)
                 marketing_label_id = get_or_create_label(service, MARKETING_LABEL)
 
-                msgs = fetch_all_unread_emails_today(service)
+                msgs = fetch_today_unread_emails(service)
                 for m in msgs:
                     msg_id = m["id"]
-                    body, _ = get_email_body_and_sender(service, msg_id)
-                    label = classify_email(body)
+                    body, sender, subject = get_email_body_and_sender(service, msg_id)
+                    label = classify_email(body, subject)
                     if label == "marketing":
                         apply_label_and_mark_read(service, msg_id, marketing_label_id)
                     else:
@@ -304,7 +322,7 @@ def create_app():
             except Exception as e:
                 print(f"Error processing {u['email']}: {e}")
 
-        last_classified_time = datetime.utcnow()
+        save_last_classified(datetime.utcnow().isoformat())
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(classify_emails_for_all_users, 'interval', minutes=5)
