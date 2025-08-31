@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 import openai
 from apscheduler.schedulers.background import BackgroundScheduler
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ---- CONFIG ----
 SCOPES = [
@@ -171,7 +171,6 @@ def get_email_body_and_sender(service, msg_id):
     return body.strip(), sender, subject
 
 def fetch_today_unread_emails(service):
-    # only emails from today
     today = datetime.utcnow().date()
     q = f"is:unread after:{today.isoformat()}"
     res = service.users().messages().list(userId="me", q=q, maxResults=500).execute()
@@ -212,7 +211,7 @@ Rules:
 - Do not misclassify company educational content as important.
 
 Email Subject + Content:
-\"\"\"{text}\"\"\"
+\"\"\"{text}\"\"\" 
 
 Reply ONLY with one word: marketing or important.
 """
@@ -298,7 +297,7 @@ def create_app():
     @app.route("/last-classified")
     def last_classified():
         ts = get_last_classified()
-        return jsonify({"last_classified": ts})
+        return jsonify({"last_classified": ts})  # still UTC
 
     # ---- BACKGROUND JOB ----
     def classify_emails_for_all_users():
@@ -322,10 +321,11 @@ def create_app():
             except Exception as e:
                 print(f"Error processing {u['email']}: {e}")
 
+        # Save UTC timestamp
         save_last_classified(datetime.utcnow().isoformat())
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(classify_emails_for_all_users, 'interval', minutes=5)
+    scheduler.add_job(classify_emails_for_all_users, 'interval', minutes=1)  # run every 1 min
     scheduler.start()
 
     return app
