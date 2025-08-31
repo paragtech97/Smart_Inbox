@@ -6,12 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         /* Reset and basic styling */
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-
+        * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background-color: #f4f4f4;
@@ -22,7 +17,6 @@
             min-height: 100vh;
             padding: 20px;
         }
-
         .container {
             width: 100%;
             max-width: 500px;
@@ -32,18 +26,8 @@
             box-shadow: 0 8px 20px rgba(0,0,0,0.15);
             text-align: center;
         }
-
-        h1 {
-            font-size: 2rem;
-            margin-bottom: 15px;
-            color: #007bff;
-        }
-
-        p {
-            font-size: 1rem;
-            margin-bottom: 20px;
-        }
-
+        h1 { font-size: 2rem; margin-bottom: 15px; color: #007bff; }
+        p { font-size: 1rem; margin-bottom: 20px; }
         a.button {
             display: inline-block;
             padding: 12px 25px;
@@ -54,18 +38,12 @@
             border-radius: 6px;
             transition: all 0.2s ease-in-out;
         }
-
-        a.button:hover {
-            background: #0056b3;
-            transform: translateY(-2px);
-        }
-
+        a.button:hover { background: #0056b3; transform: translateY(-2px); }
         .info {
             font-size: 0.9rem;
             color: #666;
             margin-top: 15px;
         }
-
         .status {
             margin-top: 10px;
             padding: 8px 12px;
@@ -75,19 +53,10 @@
             display: inline-block;
             font-size: 0.9rem;
         }
-
-        /* Mobile tweaks */
         @media (max-width: 480px) {
-            h1 {
-                font-size: 1.6rem;
-            }
-            .container {
-                padding: 25px 20px;
-            }
-            a.button {
-                width: 100%;
-                padding: 12px 0;
-            }
+            h1 { font-size: 1.6rem; }
+            .container { padding: 25px 20px; }
+            a.button { width: 100%; padding: 12px 0; }
         }
     </style>
 </head>
@@ -101,7 +70,7 @@
             <a class="button" href="{{ url_for('logout') }}">Logout</a>
 
             <div class="status" id="last-classified">Checking status...</div>
-            <div class="info">Page will automatically refresh the status every 30 seconds.</div>
+            <div class="info">Page updates every 1 minute. Times shown in <b>your local timezone</b>.</div>
 
         {% else %}
             <p>Please authorize SmartInbox to access your Gmail to start automatic email classification.</p>
@@ -113,14 +82,18 @@
     <script>
         async function fetchStatus() {
             try {
-                // Request last classification time from the server
                 const res = await fetch('/last-classified');
                 if (res.ok) {
                     const data = await res.json();
-                    document.getElementById('last-classified').textContent = 
-                        data.last_classified 
-                        ? `Last classified at: ${new Date(data.last_classified).toLocaleString()}` 
-                        : 'Classification has not run yet.';
+                    if (data.last_classified) {
+                        // Convert UTC → user’s local time
+                        const localTime = new Date(data.last_classified + "Z").toLocaleString();
+                        document.getElementById('last-classified').textContent = 
+                            `Last classified at: ${localTime}`;
+                    } else {
+                        document.getElementById('last-classified').textContent =
+                            'Classification has not run yet.';
+                    }
                 } else {
                     document.getElementById('last-classified').textContent = 'Could not fetch status';
                 }
@@ -130,7 +103,7 @@
         }
 
         fetchStatus();
-        setInterval(fetchStatus, 30000); // update every 30 seconds
+        setInterval(fetchStatus, 60000); // ✅ update every 1 min
     </script>
     {% endif %}
 </body>
