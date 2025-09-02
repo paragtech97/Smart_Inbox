@@ -4,12 +4,13 @@ import base64
 from flask import Flask, redirect, request, session, url_for, render_template, jsonify
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from bs4 import BeautifulSoup
 import openai
 from apscheduler.schedulers.background import BackgroundScheduler
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ---- CONFIG ----
 SCOPES = [
@@ -211,7 +212,7 @@ Rules:
 - Do not misclassify company educational content as important.
 
 Email Subject + Content:
-\"\"\"{text}\"\"\" 
+\"\"\"{text}\"\"\"
 
 Reply ONLY with one word: marketing or important.
 """
@@ -297,14 +298,19 @@ def create_app():
     @app.route("/last-classified")
     def last_classified():
         ts = get_last_classified()
-        return jsonify({"last_classified": ts})  # still UTC
+        return jsonify({"last_classified": ts})
 
     # ---- BACKGROUND JOB ----
     def classify_emails_for_all_users():
         users = get_all_users()
         for u in users:
             try:
+                # Load credentials and refresh if needed
                 creds = Credentials.from_authorized_user_info(u, SCOPES)
+                if creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                    save_user_credentials(u["email"], creds)
+
                 service = build_gmail_service(creds)
                 important_label_id = get_or_create_label(service, IMPORTANT_LABEL)
                 marketing_label_id = get_or_create_label(service, MARKETING_LABEL)
@@ -318,14 +324,14 @@ def create_app():
                         apply_label_and_mark_read(service, msg_id, marketing_label_id)
                     else:
                         apply_label_and_mark_read(service, msg_id, important_label_id)
+
             except Exception as e:
                 print(f"Error processing {u['email']}: {e}")
 
-        # Save UTC timestamp
         save_last_classified(datetime.utcnow().isoformat())
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(classify_emails_for_all_users, 'interval', minutes=1)  # run every 1 min
+    scheduler.add_job(classify_emails_for_all_users, 'interval', minutes=1)  # every 1 min
     scheduler.start()
 
     return app
