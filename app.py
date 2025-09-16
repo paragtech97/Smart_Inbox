@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 import openai
 from apscheduler.schedulers.background import BackgroundScheduler
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ---- CONFIG ----
 SCOPES = [
@@ -171,10 +171,9 @@ def get_email_body_and_sender(service, msg_id):
                     body = ""
     return body.strip(), sender, subject
 
-def fetch_today_unread_emails(service):
-    today = datetime.utcnow().date()
-    q = f"is:unread after:{today.isoformat()}"
-    res = service.users().messages().list(userId="me", q=q, maxResults=500).execute()
+def fetch_unread_emails(service):
+    # Loosened query: all unread, not just today
+    res = service.users().messages().list(userId="me", q="is:unread", maxResults=50).execute()
     return res.get("messages", [])
 
 def get_or_create_label(service, label_name):
@@ -217,15 +216,13 @@ Email Subject + Content:
 Reply ONLY with one word: marketing or important.
 """
 
-    messages = [
-        {"role": "system", "content": "You are an expert email classifier."},
-        {"role": "user", "content": prompt}
-    ]
-
     try:
         resp = openai.chat.completions.create(
             model="gpt-4o-mini",
-            messages=messages,
+            messages=[
+                {"role": "system", "content": "You are an expert email classifier."},
+                {"role": "user", "content": prompt}
+            ],
             max_tokens=4,
             temperature=0,
         )
@@ -233,7 +230,8 @@ Reply ONLY with one word: marketing or important.
         if "marketing" in label_raw:
             return "marketing"
         return "important"
-    except Exception:
+    except Exception as e:
+        print("Error from OpenAI:", e)
         return "marketing"  # fail-safe
 
 # ---- FLASK APP ----
@@ -288,6 +286,7 @@ def create_app():
 
         save_user_credentials(user_email, creds)
         session["google_creds"] = {"email": user_email}
+        print(f"✅ User {user_email} authenticated and saved.")
         return redirect(url_for("index"))
 
     @app.route("/logout")
@@ -302,31 +301,35 @@ def create_app():
 
     # ---- BACKGROUND JOB ----
     def classify_emails_for_all_users():
+        print("=== Running classifier at", datetime.utcnow().isoformat(), "===")
         users = get_all_users()
         for u in users:
             try:
-                # Load credentials and refresh if needed
                 creds = Credentials.from_authorized_user_info(u, SCOPES)
                 if creds.expired and creds.refresh_token:
                     creds.refresh(Request())
                     save_user_credentials(u["email"], creds)
+                    print(f"🔄 Refreshed token for {u['email']}")
 
                 service = build_gmail_service(creds)
                 important_label_id = get_or_create_label(service, IMPORTANT_LABEL)
                 marketing_label_id = get_or_create_label(service, MARKETING_LABEL)
 
-                msgs = fetch_today_unread_emails(service)
+                msgs = fetch_unread_emails(service)
+                print(f"📧 Found {len(msgs)} unread messages for {u['email']}")
+
                 for m in msgs:
                     msg_id = m["id"]
                     body, sender, subject = get_email_body_and_sender(service, msg_id)
                     label = classify_email(body, subject)
+                    print(f"   - [{subject}] from {sender} → {label}")
                     if label == "marketing":
                         apply_label_and_mark_read(service, msg_id, marketing_label_id)
                     else:
                         apply_label_and_mark_read(service, msg_id, important_label_id)
 
             except Exception as e:
-                print(f"Error processing {u['email']}: {e}")
+                print(f"❌ Error processing {u['email']}: {e}")
 
         save_last_classified(datetime.utcnow().isoformat())
 
