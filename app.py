@@ -206,17 +206,17 @@ def classify_email(content, subject=""):
         text = text[:2000] + " ... " + text[-2000:]
 
     prompt = f"""
-Classify the email as either 'marketing' or 'important'.
+Classify the email as either 'marketing', 'important', or 'unknown'.
 
 Rules:
 - 'Important' = urgent, personal, or directly relevant to you.
 - 'Marketing' = newsletters, digests, blog posts, educational updates from companies, promotional emails, or content that is not directly actionable or time-sensitive.
-- Do not misclassify company educational content as important.
+- 'Unknown' = if you cannot confidently decide.
 
 Email Subject + Content:
-"""{text}"""
+\"\"\"{text}\"\"\"
 
-Reply ONLY with one word: marketing or important.
+Reply ONLY with one word: marketing, important, or unknown.
 """
 
     messages = [
