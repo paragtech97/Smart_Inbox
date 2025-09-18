@@ -22,6 +22,7 @@ SCOPES = [
 
 IMPORTANT_LABEL = "Important Emails"
 MARKETING_LABEL = "Marketing Emails"
+UNKNOWN_LABEL = "Unclassified Emails"
 
 DB_FILE = "users.db"
 
@@ -202,7 +203,7 @@ def apply_label_and_mark_read(service, msg_id, label_id):
 def classify_email(content, subject=""):
     text = (subject + " " + content).replace("\n", " ")
     if len(text) > 4000:
-        text = text[:4000]
+        text = text[:2000] + " ... " + text[-2000:]
 
     prompt = f"""
 Classify the email as either 'marketing' or 'important'.
@@ -213,13 +214,13 @@ Rules:
 - Do not misclassify company educational content as important.
 
 Email Subject + Content:
-\"\"\"{text}\"\"\"
+"""{text}"""
 
 Reply ONLY with one word: marketing or important.
 """
 
     messages = [
-        {"role": "system", "content": "You are an expert email classifier."},
+        {"role": "system", "content": "You are a strict email classifier. Respond ONLY with 'marketing' or 'important'."},
         {"role": "user", "content": prompt}
     ]
 
@@ -231,11 +232,18 @@ Reply ONLY with one word: marketing or important.
             temperature=0,
         )
         label_raw = resp.choices[0].message.content.strip().lower()
-        if "marketing" in label_raw:
+        print("[DEBUG] GPT raw response:", label_raw)
+
+        if label_raw == "marketing":
             return "marketing"
-        return "important"
-    except Exception:
-        return "marketing"  # fail-safe
+        elif label_raw == "important":
+            return "important"
+        else:
+            print("[WARN] Unexpected response, defaulting to 'unknown':", label_raw)
+            return "unknown"
+    except Exception as e:
+        print("[ERROR] Classification failed:", e)
+        return "unknown"
 
 # ---- FLASK APP ----
 def create_app():
@@ -306,7 +314,6 @@ def create_app():
         users = get_all_users()
         for u in users:
             try:
-                # Load credentials and refresh if needed
                 creds = Credentials.from_authorized_user_info(u, SCOPES)
                 if creds.expired and creds.refresh_token:
                     creds.refresh(Request())
@@ -315,24 +322,29 @@ def create_app():
                 service = build_gmail_service(creds)
                 important_label_id = get_or_create_label(service, IMPORTANT_LABEL)
                 marketing_label_id = get_or_create_label(service, MARKETING_LABEL)
+                unknown_label_id = get_or_create_label(service, UNKNOWN_LABEL)
 
                 msgs = fetch_recent_unread_emails(service, max_results=50)
                 for m in msgs:
                     msg_id = m["id"]
                     body, sender, subject = get_email_body_and_sender(service, msg_id)
                     label = classify_email(body, subject)
+
                     if label == "marketing":
                         apply_label_and_mark_read(service, msg_id, marketing_label_id)
-                    else:
+                    elif label == "important":
                         apply_label_and_mark_read(service, msg_id, important_label_id)
+                    else:
+                        apply_label_and_mark_read(service, msg_id, unknown_label_id)
+                        print(f"[INFO] Email {msg_id} marked as 'unknown'")
 
             except Exception as e:
-                print(f"Error processing {u['email']}: {e}")
+                print(f"[ERROR] Processing {u['email']}: {e}")
 
         save_last_classified(datetime.utcnow().isoformat())
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(classify_emails_for_all_users, 'interval', minutes=1)  # every 1 min
+    scheduler.add_job(classify_emails_for_all_users, 'interval', minutes=1)
     scheduler.start()
 
     return app
